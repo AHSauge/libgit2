@@ -25,6 +25,9 @@
  */
 GIT_BEGIN_DECL
 
+struct git_signature;
+struct git_repository;
+
 /**
  * Flags for indicating option behavior for git_blame APIs.
  */
