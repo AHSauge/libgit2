@@ -599,11 +599,13 @@ static int similarity_measure(
 	if (!cache[b_idx] && (error = similarity_init(&b_info, diff, b_idx)) < 0)
 		goto cleanup;
 
-	/* check if file sizes are nowhere near each other */
+	/* check if file sizes are nowhere near each other
+	 * Assumption: A file more than doubling size is not a rename
+	 */
 	if (a_file->size > 127 &&
 		b_file->size > 127 &&
-		(a_file->size > (b_file->size << 3) ||
-		 b_file->size > (a_file->size << 3)))
+		(a_file->size > (b_file->size << 1) ||
+		 b_file->size > (a_file->size << 1)))
 		goto cleanup;
 
 	/* update signature cache if needed */
