@@ -539,6 +539,16 @@ static void similarity_unload(similarity_info *info)
 
 #define FLAG_SET(opts,flag_name) (((opts)->flags & flag_name) != 0)
 
+static const char *get_path_basename(const char *path) {
+	const char *basename = strrchr(path, '/');
+	return basename ? basename + 1 : path;
+}
+
+static size_t get_basename_len_noext(const char *basename) {
+	const char *ext = strrchr(basename, '.');
+	return ext ? (size_t)(ext - basename) : strlen(basename);
+}
+
 /* - score < 0 means files cannot be compared
  * - score >= 100 means files are exact match
  * - score == 0 means files are completely different
@@ -556,6 +566,8 @@ static int similarity_measure(
 	bool exact_match = FLAG_SET(opts, GIT_DIFF_FIND_EXACT_MATCH_ONLY);
 	int error = 0;
 	similarity_info a_info, b_info;
+	const char *a_basename, *b_basename;
+	size_t a_len, b_len;
 
 	*score = -1;
 
@@ -616,6 +628,19 @@ static int similarity_measure(
 	if (!cache[b_idx]) {
 		if ((error = similarity_sig(&b_info, opts, cache)) < 0)
 			goto cleanup;
+	}
+
+	a_basename = get_path_basename(a_file->path);
+	a_len = get_basename_len_noext(a_basename);
+
+	b_basename = get_path_basename(b_file->path);
+	b_len = get_basename_len_noext(b_basename);
+	/* Reject mismatching basenames (excluding extensions) as renames
+	 * The assumption here would be that the majority of renames are
+	 * either moving the file or changing the file extension
+	 */
+	if (a_len != b_len || strncmp(a_basename, b_basename, a_len) != 0) {
+		goto cleanup;
 	}
 
 	/* calculate similarity provided that the metric choose to process
