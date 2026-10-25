@@ -18,6 +18,8 @@
 #include "oid.h"
 #include "hash.h"
 
+#define GIT_COMMIT_GRAPH_GENERATION_NUMBER_INFINITY 0xFFFFFFFF
+
 /**
  * A commit-graph file.
  *

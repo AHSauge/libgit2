@@ -12,22 +12,37 @@
 #include "odb.h"
 #include "commit.h"
 
+uint32_t git_commit_list_generation(const git_commit_list_node *commit)
+{
+	/* Commits outside the graph is assigned infinity */
+	return commit->generation ?
+		commit->generation : GIT_COMMIT_GRAPH_GENERATION_NUMBER_INFINITY;
+}
+
 int git_commit_list_generation_cmp(const void *a, const void *b)
 {
-	uint32_t generation_a = ((git_commit_list_node *) a)->generation;
-	uint32_t generation_b = ((git_commit_list_node *) b)->generation;
+	uint32_t generation_a = ((const git_commit_list_node *) a)->generation;
+	uint32_t generation_b = ((const git_commit_list_node *) b)->generation;
 
-	if (!generation_a || !generation_b) {
-		/* Fall back to comparing by timestamps if at least one commit lacks a generation. */
+	if (!generation_a && !generation_b) {
+		/* Fall back to comparing by timestamps if both commits lacks a generation. */
 		return git_commit_list_time_cmp(a, b);
 	}
+
+	/*
+	 * At least one commit has a finite generation number,
+	 * but the other one might be infinity
+	 */
+	generation_a = git_commit_list_generation((const git_commit_list_node *) a);
+	generation_b = git_commit_list_generation((const git_commit_list_node *) b);
 
 	if (generation_a < generation_b)
 		return 1;
 	if (generation_a > generation_b)
 		return -1;
 
-	return 0;
+	/* Make commit time the tie breaker */
+	return git_commit_list_time_cmp(a, b);
 }
 
 int git_commit_list_time_cmp(const void *a, const void *b)
