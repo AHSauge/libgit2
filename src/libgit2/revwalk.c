@@ -778,6 +778,192 @@ cleanup:
 	return error;
 }
 
+/*
+ * Start tracking a commit whose children have not all been counted yet.
+ * Keeps any edges already counted from children that are non-first-parent
+ */
+static int add_to_topo_set(git_revwalk *walk, git_commit_list_node *commit)
+{
+	commit->discovered = 1;
+	commit->in_degree++;
+	return git_pqueue_insert(&walk->uncounted, commit);
+}
+
+static int count_parents(git_revwalk *walk, git_commit_list_node *commit)
+{
+	unsigned short i;
+	int error;
+
+	for (i = 0; i < commit->out_degree; i++) {
+		git_commit_list_node *parent = commit->parents[i];
+
+		/*
+		 * Count the edge in all cases to ensure no parent is emitted before
+		 * its children. Only follow the first parent when asked to.
+		 * This potentially deviates from git, but retains prior libgit2 behaviour
+		 */
+		parent->in_degree++;
+
+		if (walk->first_parent == 0 || i == 0) {
+			if ((error = git_commit_list_parse(walk, parent)) < 0)
+				return error;
+
+			if (!parent->discovered &&
+			    (error = add_to_topo_set(walk, parent)) < 0)
+				return error;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Count parents for every commit with at least this generation; children
+ * always have a higher one
+ */
+static int count_down_to(git_revwalk *walk, uint32_t generation)
+{
+	git_commit_list_node *commit;
+	int error;
+
+	while ((commit = git_pqueue_get(&walk->uncounted, 0)) != NULL &&
+	       git_commit_list_generation(commit) >= generation) {
+		git_pqueue_pop(&walk->uncounted);
+
+		if ((error = count_parents(walk, commit)) < 0)
+			return error;
+	}
+
+	return 0;
+}
+
+/*
+ * Counting down to a candidate's generation completes its in-degree before
+ * it is emitted
+ */
+static int revwalk_next_incremental_toposort(git_commit_list_node **object_out,
+	git_revwalk *walk)
+{
+	git_commit_list_node *next;
+	unsigned short i;
+	int error;
+
+	while ((next = git_pqueue_pop(&walk->topo_queue)) != NULL) {
+		if ((error = count_down_to(walk, git_commit_list_generation(next))) < 0)
+			return error;
+
+		/* Already emitted, or counting found children that are still pending */
+		if (next->in_degree != 1)
+			continue;
+
+		for (i = 0; i < next->out_degree; i++) {
+			git_commit_list_node *parent = next->parents[i];
+
+			if (parent->in_degree == 0)
+				continue;
+
+			parent->in_degree--;
+			if (parent->in_degree == 1 &&
+			    parent->discovered &&
+			    (error = git_pqueue_insert(&walk->topo_queue, parent)) < 0) {
+				return error;
+			}
+		}
+
+		next->in_degree = 0;
+		*object_out = next;
+		return 0;
+	}
+
+	git_error_clear();
+	return GIT_ITEROVER;
+}
+
+/*
+ * Indicate whether we can use generation numbers for topological walk,
+ * i.e. prepare_incremental_toposort_walk
+ */
+static bool can_use_generation_walk(git_revwalk *walk)
+{
+	git_commit_graph_file *cgraph_file = NULL;
+
+	/* Hidden commits or callback filtering need the full walk */
+	if (!(walk->sorting & GIT_SORT_TOPOLOGICAL) ||
+	    walk->did_hide || walk->hide_cb)
+		return false;
+
+	if (git_odb__get_commit_graph_file(&cgraph_file, walk->odb) < 0) {
+		git_error_clear();
+		return false;
+	}
+
+	return true;
+}
+
+/* Prepare incremental revwalk using generation number */
+static int prepare_incremental_toposort_walk(git_revwalk *walk,
+	git_commit_list *commits)
+{
+	git_vector_cmp topo_cmp = NULL;
+	git_commit_list *list;
+	int error;
+
+	if (walk->sorting & GIT_SORT_TIME)
+		topo_cmp = git_commit_list_time_cmp;
+
+	if ((error = git_pqueue_init(&walk->topo_queue, 0, 8, topo_cmp)) < 0 ||
+	    (error = git_pqueue_init(&walk->uncounted, 0, 8,
+			git_commit_list_generation_cmp)) < 0)
+		return error;
+
+	/* Every tip is a candidate until counting shows it has children */
+	for (list = commits; list; list = list->next) {
+		if ((error = add_to_topo_set(walk, list->item)) < 0 ||
+		    (error = git_pqueue_insert(&walk->topo_queue, list->item)) < 0)
+			return error;
+	}
+
+	/* Without time sorting, emit the tips in the order they were pushed */
+	if (!topo_cmp)
+		git_pqueue_reverse(&walk->topo_queue);
+
+	walk->get_next = &revwalk_next_incremental_toposort;
+	return 0;
+}
+
+/* Prepare revwalk without using generation number */
+static int prepare_full_walk(git_revwalk *walk, git_commit_list *commits)
+{
+	git_commit_list *list;
+	int error = 0;
+
+	if (walk->limited && (error = limit_list(&commits, walk, commits)) < 0)
+		return error;
+
+	if (walk->sorting & GIT_SORT_TOPOLOGICAL) {
+		error = sort_in_topological_order(&walk->iterator_topo, walk, commits);
+		git_commit_list_free(&commits);
+
+		if (error < 0)
+			return error;
+
+		walk->get_next = &revwalk_next_toposort;
+	} else if (walk->sorting & GIT_SORT_TIME) {
+		for (list = commits; list && !error; list = list->next)
+			error = walk->enqueue(walk, list->item);
+
+		git_commit_list_free(&commits);
+
+		if (error < 0)
+			return error;
+	} else {
+		walk->iterator_rand = commits;
+		walk->get_next = revwalk_next_unsorted;
+	}
+
+	return 0;
+}
+
 static int prepare_walk(git_revwalk *walk)
 {
 	int error = 0;
@@ -821,28 +1007,14 @@ static int prepare_walk(git_revwalk *walk)
 		}
 	}
 
-	if (walk->limited && (error = limit_list(&commits, walk, commits)) < 0)
+	if (can_use_generation_walk(walk)) {
+		error = prepare_incremental_toposort_walk(walk, commits);
+		git_commit_list_free(&commits);
+
+		if (error < 0)
+			return error;
+	} else if ((error = prepare_full_walk(walk, commits)) < 0) {
 		return error;
-
-	if (walk->sorting & GIT_SORT_TOPOLOGICAL) {
-		error = sort_in_topological_order(&walk->iterator_topo, walk, commits);
-		git_commit_list_free(&commits);
-
-		if (error < 0)
-			return error;
-
-		walk->get_next = &revwalk_next_toposort;
-	} else if (walk->sorting & GIT_SORT_TIME) {
-		for (list = commits; list && !error; list = list->next)
-			error = walk->enqueue(walk, list->item);
-
-		git_commit_list_free(&commits);
-
-		if (error < 0)
-			return error;
-	} else {
-		walk->iterator_rand = commits;
-		walk->get_next = revwalk_next_unsorted;
 	}
 
 	if (walk->sorting & GIT_SORT_REVERSE) {
@@ -1007,10 +1179,13 @@ int git_revwalk_reset(git_revwalk *walk)
 		commit->topo_delay = 0;
 		commit->uninteresting = 0;
 		commit->added = 0;
+		commit->discovered = 0;
 		commit->flags = 0;
 	}
 
 	git_pqueue_clear(&walk->iterator_time);
+	git_pqueue_free(&walk->topo_queue);
+	git_pqueue_free(&walk->uncounted);
 	git_commit_list_free(&walk->iterator_topo);
 	git_commit_list_free(&walk->iterator_rand);
 	git_commit_list_free(&walk->iterator_reverse);

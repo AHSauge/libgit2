@@ -49,6 +49,10 @@ struct git_revwalk {
 
 	git_pathspec *pathspec;
 	bool pathspec_wildcard;
+
+	/* speed-up with generation number v1 */
+	git_pqueue topo_queue;
+	git_pqueue uncounted;
 };
 
 git_commit_list_node *git_revwalk__commit_lookup(git_revwalk *walk, const git_oid *oid);
