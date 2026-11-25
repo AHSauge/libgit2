@@ -378,10 +378,12 @@ static void mark_parents_uninteresting(git_commit_list_node *commit)
 	}
 }
 
+static int merge_treesame_parent(git_revwalk *walk, git_commit_list_node *node);
+
 static int add_parents_to_list(git_revwalk *walk, git_commit_list_node *commit, git_commit_list **list)
 {
 	unsigned short i;
-	int error;
+	int error, keep = -1;
 
 	if (commit->added)
 		return 0;
@@ -420,8 +422,15 @@ static int add_parents_to_list(git_revwalk *walk, git_commit_list_node *commit, 
 	 * interesting. Here we do want things like first-parent take
 	 * effect as this is what we'll be showing.
 	 */
+	if (walk->pathspec && !walk->first_parent && commit->out_degree > 1)
+		keep = merge_treesame_parent(walk, commit);
+
 	for (i = 0; i < commit->out_degree; i++) {
 		git_commit_list_node *p = commit->parents[i];
+
+		/* The path came from this parent, so skip the other branches */
+		if (keep >= 0 && (int)i != keep)
+			continue;
 
 		if ((error = git_commit_list_parse(walk, p)) < 0)
 			return error;
@@ -587,6 +596,62 @@ static bool include_path_exact_parent(git_revwalk *walk, git_tree *commit_tree, 
 	return false;
 }
 
+static bool path_differs(git_revwalk *walk, git_tree *commit_tree, git_tree *parent_tree)
+{
+	git_diff_options diffopts = GIT_DIFF_OPTIONS_INIT;
+
+	if (!walk->pathspec_wildcard)
+		return include_path_exact_parent(walk, commit_tree, parent_tree);
+
+	if (walk->pathspec->prefix) {
+		diffopts.pathspec.strings = &walk->pathspec->prefix;
+		diffopts.pathspec.count = 1;
+	}
+
+	return include_path_delta(walk, commit_tree, parent_tree, &diffopts);
+}
+
+/*
+ * Returns the index of an interesting parent that the merge is TREESAME
+ * to, or -1. The result is recorded on the node for include_path.
+ */
+static int merge_treesame_parent(git_revwalk *walk, git_commit_list_node *node)
+{
+	git_commit *commit = NULL;
+	git_tree *commit_tree = NULL;
+	unsigned int i;
+	int keep = -1;
+
+	if (git_commit_lookup(&commit, walk->repo, &node->oid) < 0 ||
+	    git_commit_tree(&commit_tree, commit) < 0) {
+		git_commit_free(commit);
+		git_error_clear();
+		return -1;
+	}
+
+	for (i = 0; i < node->out_degree && keep < 0; i++) {
+		git_commit *parent = NULL;
+		git_tree *parent_tree = NULL;
+
+		if (git_commit_parent(&parent, commit, i) == 0 &&
+		    git_commit_tree(&parent_tree, parent) == 0 &&
+		    !path_differs(walk, commit_tree, parent_tree)) {
+			node->treesame = 1;
+
+			if (!node->parents[i]->uninteresting)
+				keep = (int)i;
+		}
+
+		git_tree_free(parent_tree);
+		git_commit_free(parent);
+	}
+
+	node->path_checked = 1;
+	git_tree_free(commit_tree);
+	git_commit_free(commit);
+	return keep;
+}
+
 static bool include_path_exact(git_revwalk *walk, git_commit *commit, git_tree *commit_tree) {
 	unsigned int parents = git_commit_parentcount(commit);
 	if (parents == 0) {
@@ -618,6 +683,9 @@ static bool include_path(git_revwalk *walk, git_commit_list_node *commit_node)
 	git_commit *commit = NULL;
 	git_tree *commit_tree = NULL;
 	bool include = false;
+
+	if (commit_node->path_checked)
+		return !commit_node->treesame;
 
 	if (git_commit_lookup(&commit, walk->repo, &commit_node->oid) == 0
 		&& git_commit_tree(&commit_tree, commit) == 0) {
@@ -1005,6 +1073,8 @@ int git_revwalk_reset(git_revwalk *walk)
 		commit->topo_delay = 0;
 		commit->uninteresting = 0;
 		commit->added = 0;
+		commit->path_checked = 0;
+		commit->treesame = 0;
 		commit->flags = 0;
 	}
 
